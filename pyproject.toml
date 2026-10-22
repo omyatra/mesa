@@ -8,6 +8,7 @@ packages = ["mesa", "mesa.strategies"]
 
 [project]
 name = "mesa"
+version = "0.1.0"
 authors = [
     {name = "Chris Bowman", email = "chris.bowman.physics@gmail.com"},
     {name = "Jarrod Leddy", email = "jarrodleddy@microsoft.com"},
