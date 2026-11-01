@@ -3,7 +3,9 @@ from abc import ABC, abstractmethod
 from typing import Literal, Any
 
 
-RunStatus = Literal["running", "complete", "timed-out", "crashed"]
+# "stalled": the plug-in has stopped trying to converge the run; it is
+# scored like a complete run, and marked "stalled" in the evaluations file
+RunStatus = Literal["running", "complete", "stalled", "timed-out", "crashed"]
 
 
 class SimulationRun(ABC):

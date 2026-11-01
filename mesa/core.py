@@ -1,7 +1,7 @@
 from pathlib import Path
+from numpy import nan
 from pandas import DataFrame, read_hdf, concat
 from time import sleep
-import subprocess
 import os
 import logging
 
@@ -54,9 +54,11 @@ class Mesa:
         objective_key = self.objective_function.name
 
         self.metadata_keys = ["run_number", "iteration"]
-        self.data_columns = [*self.metadata_keys, objective_key, *parameter_keys]
+        # status of the finished run: "complete", "stalled", "crashed" or "timed-out"
+        self.data_columns = [*self.metadata_keys, "status", objective_key, *parameter_keys]
         self.data_types = {
             **{k: "int64" for k in self.metadata_keys},
+            "status": "object",
             **{objective_key: "float64"},
             **{k: "float64" for k in parameter_keys}
         }
@@ -162,7 +164,7 @@ class Mesa:
                     continue
                 status_failures.pop(run, None)
 
-                if run_status == "complete":
+                if run_status in ("complete", "stalled"):
                     # get the objective function value
                     try:
                         objective_values = self.objective_function.evaluate(
@@ -176,24 +178,12 @@ class Mesa:
                             f"counted as crashed; folder kept: {run.directory}",
                             exc_info=True,
                         )
+                        self.__add_evaluation(run, iteration, "crashed")
                         current_runs.remove(run)
                         completed_runs.add(run)
                         continue
 
-                    # build a new row for the dataframe
-                    new_row = {"run_number": run.run_number, "iteration": iteration}
-                    new_row.update(objective_values)
-                    new_row.update(run.parameters)
-
-                    # build a dataframe for the latest evaluation
-                    new_df = DataFrame(new_row, index=[run.run_number])
-                    new_df = new_df.astype(self.data_types)
-
-                    # update the evaluation data with the new dataframe
-                    df: DataFrame = read_hdf(self.evaluations_filepath)
-                    df = new_df if df.empty else concat([df, new_df])
-                    df.sort_index(inplace=True)
-                    self.__write_evaluations_data(df)
+                    self.__add_evaluation(run, iteration, run_status, objective_values)
 
                     # now the run results are saved we can stop tracking the run
                     current_runs.remove(run)
@@ -204,10 +194,10 @@ class Mesa:
                 elif run_status == "crashed":
                     logging.info("[ crash warning ]")
                     logging.info(
-                        f">> run #{run.run_number} has crashed"
+                        f">> run #{run.run_number} has crashed; folder kept: {run.directory}"
                     )
+                    self.__add_evaluation(run, iteration, "crashed")
                     current_runs.remove(run)  # remove it from the current runs
-                    subprocess.run(["rm", "-r", run.directory])  # remove run directory
                     # currently no provision for re-starting runs, so mark it complete
                     completed_runs.add(run)
 
@@ -217,8 +207,8 @@ class Mesa:
                         f">> iteration {run.run_number} has timed-out"
                     )
                     run.cancel()  # cancel the timed-out job
+                    self.__add_evaluation(run, iteration, "timed-out")
                     current_runs.remove(run)  # remove it from the current runs
-                    subprocess.run(["rm", "-r", run.directory])  # remove run directory
                     # currently no provision for re-starting runs, so mark it complete
                     completed_runs.add(run)
 
@@ -249,6 +239,32 @@ class Mesa:
             # wait before the next check, unless the iteration is done
             if len(completed_runs) < total_requested_runs:
                 sleep(self.poll_interval)
+
+    def __add_evaluation(
+        self,
+        run: SimulationRun,
+        iteration: int,
+        status: str,
+        objective_values: dict[str, float] | None = None,
+    ):
+        # add a row for a finished run to the evaluations file; a run with no
+        # score (crashed or timed-out) gets NaN as its objective value
+        new_row = {"run_number": run.run_number, "iteration": iteration, "status": status}
+        if objective_values is None:
+            new_row[self.objective_function.name] = nan
+        else:
+            new_row.update(objective_values)
+        new_row.update(run.parameters)
+
+        # build a dataframe for the latest evaluation
+        new_df = DataFrame(new_row, index=[run.run_number])
+        new_df = new_df.astype(self.data_types)
+
+        # update the evaluation data with the new dataframe
+        df: DataFrame = read_hdf(self.evaluations_filepath)
+        df = new_df if df.empty else concat([df, new_df])
+        df.sort_index(inplace=True)
+        self.__write_evaluations_data(df)
 
     def __initialize_evaluations_data_file(self):
         # create the empty dataframe to store the evaluation data and save it to HDF
