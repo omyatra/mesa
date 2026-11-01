@@ -2,6 +2,7 @@ from pathlib import Path
 from pandas import DataFrame, read_hdf, concat
 from time import sleep
 import subprocess
+import os
 import logging
 
 from mesa.simulations import Simulation, SimulationRun
@@ -186,13 +187,13 @@ class Mesa:
 
                     # build a dataframe for the latest evaluation
                     new_df = DataFrame(new_row, index=[run.run_number])
-                    new_df.astype(self.data_types)
+                    new_df = new_df.astype(self.data_types)
 
                     # update the evaluation data with the new dataframe
                     df: DataFrame = read_hdf(self.evaluations_filepath)
                     df = new_df if df.empty else concat([df, new_df])
                     df.sort_index(inplace=True)
-                    df.to_hdf(self.evaluations_filepath, key="evaluations", mode="w")
+                    self.__write_evaluations_data(df)
 
                     # now the run results are saved we can stop tracking the run
                     current_runs.remove(run)
@@ -252,12 +253,19 @@ class Mesa:
     def __initialize_evaluations_data_file(self):
         # create the empty dataframe to store the evaluation data and save it to HDF
         df = DataFrame(columns=self.data_columns)
-        df.astype(self.data_types)
-        df.to_hdf(
-            self.evaluations_filepath,
-            key="evaluations",
-            mode="w",
+        df = df.astype(self.data_types)
+        self.__write_evaluations_data(df)
+
+    def __write_evaluations_data(self, df: DataFrame):
+        # write to a tmp file in the same folder, then rename it onto the
+        # evaluations file: os.replace is atomic on the same file system, so
+        # the file is always either the old or the new version, never a
+        # partly written one
+        tmp_filepath = self.evaluations_filepath.with_name(
+            self.evaluations_filepath.name + ".tmp"
         )
+        df.to_hdf(tmp_filepath, key="evaluations", mode="w")
+        os.replace(tmp_filepath, self.evaluations_filepath)
 
     @classmethod
     def build_from_input_module(cls, input_module: Path):
