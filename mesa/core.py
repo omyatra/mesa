@@ -72,7 +72,11 @@ class Mesa:
         (evaluation data file, optimiser, settings, anything unexpected) is
         logged with the runs still in flight, then raised: the driver stops,
         and the jobs are not cancelled, so they can be picked up again.
+
+        The log goes to mesa.log in the simulations directory, and to the
+        screen.
         """
+        logger_setup(self.simulations_directory)
         self.runs_in_flight: set[SimulationRun] = set()
         try:
             self.__run()
@@ -299,17 +303,29 @@ class Mesa:
         )
 
 
-def logger_setup(settings_filepath):
-    path = (
-        settings_filepath[:-3]
-        if settings_filepath.endswith(".py")
-        else settings_filepath
-    )
-    logging.basicConfig(
-        filename=path + ".log",
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
+def logger_setup(simulations_directory: Path):
+    """
+    Sends the log (INFO and above, from every logger) to mesa.log in the
+    simulations directory, appended to across restarts, and to the screen,
+    both with timestamps. Calling it again for the same folder adds nothing.
+    """
+    log_filepath = (Path(simulations_directory) / "mesa.log").resolve()
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in root_logger.handlers:
+        if (
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename) == log_filepath
+        ):
+            return  # already set up
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Write to the screen as well
-    logging.getLogger().addHandler(logging.StreamHandler())
+    file_handler = logging.FileHandler(log_filepath, mode="a", encoding="utf-8")
+    # write to the screen as well
+    screen_handler = logging.StreamHandler()
+    for handler in (file_handler, screen_handler):
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
