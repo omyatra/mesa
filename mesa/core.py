@@ -121,6 +121,7 @@ class Mesa:
                     current_runs.add(
                         self.simulation.launch(
                             run_number=run_number,
+                            iteration=iteration,
                             simulations_directory=self.simulations_directory,
                             parameters=point,
                         )

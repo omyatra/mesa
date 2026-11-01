@@ -66,8 +66,10 @@ class Himmelblau(Simulation):
     def launch(
         self,
         run_number: int,
+        iteration: int,
         simulations_directory: Path,
         parameters: dict,
+        **kwargs,
     ) -> HimmelblauRun:
 
         case_directory = simulations_directory / f"run_{run_number}"

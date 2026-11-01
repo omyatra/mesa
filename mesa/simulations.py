@@ -39,9 +39,19 @@ class Simulation(ABC):
     def launch(
         self,
         run_number: int,
+        iteration: int,
         simulations_directory: Path,
         parameters: dict,
+        **kwargs,
     ) -> SimulationRun:
+        """
+        Launches one run and returns it.
+
+        The engine passes every argument by keyword. Implementations should
+        accept **kwargs, so that the engine can pass more information in
+        later versions without breaking existing plug-ins; arguments a
+        plug-in doesn't use can be ignored.
+        """
         pass
 
     # def create_case_directory(
