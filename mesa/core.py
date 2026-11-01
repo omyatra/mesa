@@ -117,10 +117,18 @@ class Mesa:
             self.__mark_heartbeat_stopped(stopped_by)
 
     def __run(self):
+        # runs left in flight by an earlier driver are finished first
+        self.__finish_adopted_runs()
+
         while not self.converged:
             df: DataFrame = read_hdf(self.evaluations_filepath)
-            # get the current iteration number
-            initial_run_number = 0 if df.empty else df["run_number"].max() + 1
+            # get the current iteration number; the first new run number is
+            # past every recorded run and every run folder
+            run_folders = self.__existing_run_numbers()
+            initial_run_number = max(
+                0 if df.empty else int(df["run_number"].max()) + 1,
+                max(run_folders, default=-1) + 1,
+            )
             iteration = 0 if df.empty else df["iteration"].max() + 1
 
             if iteration > self.max_iterations:
@@ -142,6 +150,75 @@ class Mesa:
                 initial_run_number=initial_run_number,
                 pending_points=new_points,
             )
+
+    def __existing_run_numbers(self) -> set[int]:
+        return {
+            int(n)
+            for n in self.simulation.existing_run_numbers(
+                simulations_directory=self.simulations_directory
+            )
+        }
+
+    def __finish_adopted_runs(self):
+        """
+        Re-adopts the runs that have a folder but no row in the evaluations
+        file (left in flight when an earlier driver stopped), and polls them
+        with the normal status handling until all have finished and been
+        recorded, each with its own iteration. A folder that can't be
+        adopted is logged as needing attention and skipped.
+        """
+        df: DataFrame = read_hdf(self.evaluations_filepath)
+        recorded = {int(n) for n in df["run_number"]}
+        unrecorded = sorted(self.__existing_run_numbers() - recorded)
+        if not unrecorded:
+            return
+
+        adopted: set[SimulationRun] = set()
+        for run_number in unrecorded:
+            try:
+                run = self.simulation.adopt(
+                    run_number=run_number,
+                    simulations_directory=self.simulations_directory,
+                )
+            except Exception as error:
+                logging.warning(
+                    f"run {run_number}: adopting the run failed ({error!r})",
+                    exc_info=True,
+                )
+                run = None
+            if run is not None and getattr(run, "iteration", None) is None:
+                logging.warning(
+                    f"run {run_number}: the adopted run has no iteration number"
+                )
+                run = None
+            if run is None:
+                logging.warning(
+                    f"run {run_number}: folder with no evaluation row can't be "
+                    f"adopted, needs attention; skipped"
+                )
+                continue
+            logging.info(
+                f"run {run_number}: adopted from an earlier driver "
+                f"(iteration {run.iteration}): {run.directory}"
+            )
+            adopted.add(run)
+
+        if not adopted:
+            return
+        logging.info(f"--- Finishing {len(adopted)} adopted runs ---")
+        # kept on self so that run() can log them on an error, and for the
+        # heartbeat (no single iteration: each run has its own)
+        self.runs_in_flight = adopted
+        self.run_statuses = {run: "adopted" for run in adopted}
+        self.current_iteration = None
+        status_failures: dict[SimulationRun, int] = {}
+        while adopted:
+            for run in [run for run in adopted]:
+                if self.__check_run(run, run.iteration, status_failures):
+                    adopted.remove(run)
+            self.__write_heartbeat("running")
+            if adopted:
+                sleep(self.poll_interval)
 
     def launch_iteration(
         self, iteration: int, initial_run_number: int, pending_points: list[dict]
@@ -174,73 +251,9 @@ class Mesa:
             # they have finished or timed-out
             run: SimulationRun
             for run in current_runs_iterable:
-                try:
-                    run_status = run.status()
-                except Exception as error:
-                    # e.g. an output file read mid-write, or a scheduler or
-                    # file-system hiccup: treat the run as running, retry next poll
-                    failures = status_failures.get(run, 0) + 1
-                    status_failures[run] = failures
-                    self.run_statuses[run] = "status check failed"
-                    logging.warning(
-                        f"run {run.run_number}: status check failed ({error!r}), "
-                        f"retrying next poll",
-                        exc_info=failures == 1,  # traceback once per streak
-                    )
-                    if failures == 3:
-                        logging.warning(
-                            f"run {run.run_number}: status check failing, needs attention"
-                        )
-                    continue
-                status_failures.pop(run, None)
-                self.run_statuses[run] = run_status
-
-                if run_status in ("complete", "stalled"):
-                    # get the objective function value
-                    try:
-                        objective_values = self.objective_function.evaluate(
-                            simulation_results=run.get_results()
-                        )
-                    except Exception as error:
-                        # a bad result from this run: count it as crashed and
-                        # carry on with the others (its folder is kept)
-                        logging.warning(
-                            f"run {run.run_number}: scoring failed ({error!r}), "
-                            f"counted as crashed; folder kept: {run.directory}",
-                            exc_info=True,
-                        )
-                        self.__add_evaluation(run, iteration, "crashed")
-                        current_runs.remove(run)
-                        completed_runs.add(run)
-                        continue
-
-                    self.__add_evaluation(run, iteration, run_status, objective_values)
-
-                    # now the run results are saved we can stop tracking the run
+                if self.__check_run(run, iteration, status_failures):
+                    # the run is recorded, so we can stop tracking it
                     current_runs.remove(run)
-                    completed_runs.add(run)
-                    # clean up the run directory
-                    run.cleanup()
-
-                elif run_status == "crashed":
-                    logging.info("[ crash warning ]")
-                    logging.info(
-                        f">> run #{run.run_number} has crashed; folder kept: {run.directory}"
-                    )
-                    self.__add_evaluation(run, iteration, "crashed")
-                    current_runs.remove(run)  # remove it from the current runs
-                    # currently no provision for re-starting runs, so mark it complete
-                    completed_runs.add(run)
-
-                elif run_status == "timed-out":
-                    logging.info("[ time-out warning ]")
-                    logging.info(
-                        f">> iteration {run.run_number} has timed-out"
-                    )
-                    run.cancel()  # cancel the timed-out job
-                    self.__add_evaluation(run, iteration, "timed-out")
-                    current_runs.remove(run)  # remove it from the current runs
-                    # currently no provision for re-starting runs, so mark it complete
                     completed_runs.add(run)
 
             # if we are not at the maximum allowed number of concurrent runs
@@ -272,6 +285,82 @@ class Mesa:
             # wait before the next check, unless the iteration is done
             if len(completed_runs) < total_requested_runs:
                 sleep(self.poll_interval)
+
+    def __check_run(
+        self,
+        run: SimulationRun,
+        iteration: int,
+        status_failures: dict[SimulationRun, int],
+    ) -> bool:
+        """
+        Checks one run in flight. If it has finished, records it in the
+        evaluations file (with the given iteration) and returns True;
+        otherwise returns False. status_failures counts consecutive failed
+        status checks per run.
+        """
+        try:
+            run_status = run.status()
+        except Exception as error:
+            # e.g. an output file read mid-write, or a scheduler or
+            # file-system hiccup: treat the run as running, retry next poll
+            failures = status_failures.get(run, 0) + 1
+            status_failures[run] = failures
+            self.run_statuses[run] = "status check failed"
+            logging.warning(
+                f"run {run.run_number}: status check failed ({error!r}), "
+                f"retrying next poll",
+                exc_info=failures == 1,  # traceback once per streak
+            )
+            if failures == 3:
+                logging.warning(
+                    f"run {run.run_number}: status check failing, needs attention"
+                )
+            return False
+        status_failures.pop(run, None)
+        self.run_statuses[run] = run_status
+
+        if run_status in ("complete", "stalled"):
+            # get the objective function value
+            try:
+                objective_values = self.objective_function.evaluate(
+                    simulation_results=run.get_results()
+                )
+            except Exception as error:
+                # a bad result from this run: count it as crashed and
+                # carry on with the others (its folder is kept)
+                logging.warning(
+                    f"run {run.run_number}: scoring failed ({error!r}), "
+                    f"counted as crashed; folder kept: {run.directory}",
+                    exc_info=True,
+                )
+                self.__add_evaluation(run, iteration, "crashed")
+                return True
+
+            self.__add_evaluation(run, iteration, run_status, objective_values)
+            # clean up the run directory
+            run.cleanup()
+            return True
+
+        elif run_status == "crashed":
+            logging.info("[ crash warning ]")
+            logging.info(
+                f">> run #{run.run_number} has crashed; folder kept: {run.directory}"
+            )
+            # currently no provision for re-starting runs, so it is finished
+            self.__add_evaluation(run, iteration, "crashed")
+            return True
+
+        elif run_status == "timed-out":
+            logging.info("[ time-out warning ]")
+            logging.info(
+                f">> iteration {run.run_number} has timed-out"
+            )
+            run.cancel()  # cancel the timed-out job
+            # currently no provision for re-starting runs, so it is finished
+            self.__add_evaluation(run, iteration, "timed-out")
+            return True
+
+        return False
 
     def __add_evaluation(
         self,

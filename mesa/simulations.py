@@ -13,6 +13,9 @@ class SimulationRun(ABC):
     directory: Path
     run_number: int
     launch_time: float
+    # the iteration the run was launched in; must be set on adopted runs
+    # (see Simulation.adopt)
+    iteration: int | None = None
     # optional: the scheduler's ID for the run's current job, if there is
     # one; shown in the heartbeat file
     job_id: str | None = None
@@ -58,6 +61,29 @@ class Simulation(ABC):
         plug-in doesn't use can be ignored.
         """
         pass
+
+    def existing_run_numbers(self, simulations_directory: Path, **kwargs) -> set[int]:
+        """
+        Optional, for resuming after a driver restart: the run numbers that
+        have a folder in the simulations directory, whether or not they have
+        finished. The engine uses them to find runs to adopt, and so that new
+        run numbers don't clash with existing folders. Default: none.
+        """
+        return set()
+
+    def adopt(
+        self, run_number: int, simulations_directory: Path, **kwargs
+    ) -> SimulationRun | None:
+        """
+        Optional, for resuming after a driver restart: rebuilds the run with
+        this number from what it saved when it was launched, or returns None
+        if it can't (e.g. it was never submitted). The returned run must have
+        its parameters and iteration set; the engine then polls it with
+        status() like any other run. Called for each number from
+        existing_run_numbers() that has no row in the evaluations file.
+        Default: None.
+        """
+        return None
 
     # def create_case_directory(
     #     self,
