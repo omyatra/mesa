@@ -1,5 +1,5 @@
 from runpy import run_path
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, MISSING
 from pathlib import Path
 from os.path import isfile
 from inspect import get_annotations
@@ -19,6 +19,8 @@ class MesaInputs:
     max_concurrent_runs: int
     max_iterations: int
     parameters: dict
+    # optional: seconds between checks of the runs in flight
+    poll_interval: int | float = 1800.0
 
     def __post_init__(self):
         assert (
@@ -100,8 +102,10 @@ def parse_input_module(settings_filepath: Path | str) -> MesaInputs:
 
     annotations = get_annotations(MesaInputs)
 
-    # verify all the required variables exist in the input file
-    for variable_name in annotations.keys():
+    # verify all the required variables (those without a default) exist in
+    # the input file
+    required = [f.name for f in fields(MesaInputs) if f.default is MISSING]
+    for variable_name in required:
         if variable_name not in settings:
             raise KeyError(
                 f"""\n
@@ -111,8 +115,10 @@ def parse_input_module(settings_filepath: Path | str) -> MesaInputs:
                 """
             )
 
-    # verify all variables have the requested types
+    # verify all variables given have the requested types
     for variable_name, requested_type in annotations.items():
+        if variable_name not in settings:
+            continue  # optional, so the default is used
         if not isinstance(settings[variable_name], requested_type):
             raise TypeError(
                 f"""\n
@@ -125,7 +131,9 @@ def parse_input_module(settings_filepath: Path | str) -> MesaInputs:
             )
 
     parsed_inputs = {
-        variable_name: settings[variable_name] for variable_name in annotations.keys()
+        variable_name: settings[variable_name]
+        for variable_name in annotations.keys()
+        if variable_name in settings
     }
 
     return MesaInputs(**parsed_inputs)

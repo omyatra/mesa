@@ -20,7 +20,8 @@ class Mesa:
         max_concurrent_runs: int,
         max_iterations: int,
         evaluations_filepath: Path,
-        simulations_directory: Path
+        simulations_directory: Path,
+        poll_interval: float = 1800.0,
     ):
         self.parameters = parameters
         self.simulation = simulation
@@ -28,6 +29,8 @@ class Mesa:
         self.strategy = strategy
         self.max_concurrent_runs = max_concurrent_runs
         self.max_iterations = max_iterations
+        # seconds between checks of the runs in flight
+        self.poll_interval = poll_interval
 
         assert evaluations_filepath.is_file() or not evaluations_filepath.exists()
         assert simulations_directory.is_dir()
@@ -101,32 +104,9 @@ class Mesa:
             range(initial_run_number, initial_run_number + total_requested_runs)
         )
 
-        # main monitoring loop for the simulation runs
+        # main monitoring loop for the simulation runs: each pass checks the
+        # runs in flight, then fills the free slots, then waits
         while len(completed_runs) < total_requested_runs:
-            # if we are not at the maximum allowed number of concurrent runs
-            # then launch enough to bring us to the maximum
-            available_runs = min(
-                self.max_concurrent_runs - len(current_runs), len(pending_run_numbers)
-            )
-            if available_runs:
-                runs_to_launch = [
-                    pending_run_numbers.pop() for _ in range(available_runs)
-                ]
-
-                for run_number in runs_to_launch:
-                    point = pending_points.pop()
-                    logging.info(f"Run number {run_number} - New parameters:")
-                    logging.info([point[k] for k in self.free_parameter_keys])
-
-                    current_runs.add(
-                        self.simulation.launch(
-                            run_number=run_number,
-                            iteration=iteration,
-                            simulations_directory=self.simulations_directory,
-                            parameters=point,
-                        )
-                    )
-
             # we can't modify the current_runs set while we're iterating over it,
             # so make a copy which we can iterate over
             current_runs_iterable = [run for run in current_runs]
@@ -183,9 +163,33 @@ class Mesa:
                     # currently no provision for re-starting runs, so mark it complete
                     completed_runs.add(run)
 
-            # if we're still at the maximum concurrent runs, pause for a bit before re-checking
-            if len(current_runs) == self.max_concurrent_runs:
-                sleep(5)
+            # if we are not at the maximum allowed number of concurrent runs
+            # then launch enough to bring us to the maximum
+            available_runs = min(
+                self.max_concurrent_runs - len(current_runs), len(pending_run_numbers)
+            )
+            if available_runs:
+                runs_to_launch = [
+                    pending_run_numbers.pop() for _ in range(available_runs)
+                ]
+
+                for run_number in runs_to_launch:
+                    point = pending_points.pop()
+                    logging.info(f"Run number {run_number} - New parameters:")
+                    logging.info([point[k] for k in self.free_parameter_keys])
+
+                    current_runs.add(
+                        self.simulation.launch(
+                            run_number=run_number,
+                            iteration=iteration,
+                            simulations_directory=self.simulations_directory,
+                            parameters=point,
+                        )
+                    )
+
+            # wait before the next check, unless the iteration is done
+            if len(completed_runs) < total_requested_runs:
+                sleep(self.poll_interval)
 
     def __initialize_evaluations_data_file(self):
         # create the empty dataframe to store the evaluation data and save it to HDF
@@ -209,6 +213,7 @@ class Mesa:
             max_iterations = mesa_inputs.max_iterations,
             evaluations_filepath = mesa_inputs.evaluations_filepath,
             simulations_directory = mesa_inputs.simulations_directory,
+            poll_interval = mesa_inputs.poll_interval,
         )
 
 
