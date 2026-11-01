@@ -2,7 +2,10 @@ from pathlib import Path
 from numpy import nan
 from pandas import DataFrame, read_hdf, concat
 from time import sleep
+from datetime import datetime
+import json
 import os
+import socket
 import logging
 
 from mesa.simulations import Simulation, SimulationRun
@@ -37,6 +40,9 @@ class Mesa:
         assert simulations_directory.is_dir()
         self.evaluations_filepath = evaluations_filepath
         self.simulations_directory = simulations_directory
+        # rewritten after each pass: whether the driver is alive and what it
+        # is waiting on
+        self.heartbeat_filepath = simulations_directory / "heartbeat.json"
         self.converged = False
 
         # split the parameters up into those which have free or fixed values
@@ -75,12 +81,26 @@ class Mesa:
 
         The log goes to mesa.log in the simulations directory, and to the
         screen.
+
+        heartbeat.json in the simulations directory is rewritten at start-up
+        and after each pass (state "running"), and once more when the driver
+        stops (state "stopped"). The driver refuses to start if it finds a
+        "running" heartbeat younger than 2 x poll_interval: another driver
+        may be working on the same case.
         """
         logger_setup(self.simulations_directory)
+        self.__check_heartbeat()
         self.runs_in_flight: set[SimulationRun] = set()
+        # the last status of each run in flight, for the heartbeat
+        self.run_statuses: dict[SimulationRun, str] = {}
+        self.current_iteration: int | None = None
+        self.__write_heartbeat("running")
+        stopped_by = "interrupted"  # e.g. Ctrl-C
         try:
             self.__run()
-        except Exception:
+            stopped_by = "finished"
+        except Exception as error:
+            stopped_by = f"error: {error!r}"
             logging.exception("[ MESA error ] driver stopping on an unexpected error")
             if self.runs_in_flight:
                 logging.error(
@@ -93,6 +113,8 @@ class Mesa:
             else:
                 logging.error("no runs in flight")
             raise
+        finally:
+            self.__mark_heartbeat_stopped(stopped_by)
 
     def __run(self):
         while not self.converged:
@@ -128,9 +150,12 @@ class Mesa:
         Launches and manages all the simulations runs required to complete
         the current iteration.
         """
-        # the runs in flight; kept on self so that run() can log them on an error
+        # the runs in flight; kept on self so that run() can log them on an
+        # error, and for the heartbeat
         current_runs: set[SimulationRun] = set()
         self.runs_in_flight = current_runs
+        self.run_statuses = {}
+        self.current_iteration = iteration
         completed_runs: set[SimulationRun] = set()
         # consecutive failed status checks, per run
         status_failures: dict[SimulationRun, int] = {}
@@ -156,6 +181,7 @@ class Mesa:
                     # file-system hiccup: treat the run as running, retry next poll
                     failures = status_failures.get(run, 0) + 1
                     status_failures[run] = failures
+                    self.run_statuses[run] = "status check failed"
                     logging.warning(
                         f"run {run.run_number}: status check failed ({error!r}), "
                         f"retrying next poll",
@@ -167,6 +193,7 @@ class Mesa:
                         )
                     continue
                 status_failures.pop(run, None)
+                self.run_statuses[run] = run_status
 
                 if run_status in ("complete", "stalled"):
                     # get the objective function value
@@ -231,14 +258,16 @@ class Mesa:
                     logging.info(f"Run number {run_number} - New parameters:")
                     logging.info([point[k] for k in self.free_parameter_keys])
 
-                    current_runs.add(
-                        self.simulation.launch(
-                            run_number=run_number,
-                            iteration=iteration,
-                            simulations_directory=self.simulations_directory,
-                            parameters=point,
-                        )
+                    new_run = self.simulation.launch(
+                        run_number=run_number,
+                        iteration=iteration,
+                        simulations_directory=self.simulations_directory,
+                        parameters=point,
                     )
+                    current_runs.add(new_run)
+                    self.run_statuses[new_run] = "launched"
+
+            self.__write_heartbeat("running")
 
             # wait before the next check, unless the iteration is done
             if len(completed_runs) < total_requested_runs:
@@ -269,6 +298,104 @@ class Mesa:
         df = new_df if df.empty else concat([df, new_df])
         df.sort_index(inplace=True)
         self.__write_evaluations_data(df)
+
+    def __heartbeat(self, state: str) -> dict:
+        runs = sorted(self.runs_in_flight, key=lambda r: r.run_number)
+        return {
+            "state": state,
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "iteration": (
+                None if self.current_iteration is None else int(self.current_iteration)
+            ),
+            "runs_in_flight": [
+                {
+                    "run_number": int(run.run_number),
+                    "job_id": run.job_id,
+                    "status": self.run_statuses.get(run),
+                }
+                for run in runs
+            ],
+        }
+
+    def __write_heartbeat(self, state: str, stopped_by: str | None = None):
+        # tmp file + rename, so a reader never sees a partly written file
+        heartbeat = self.__heartbeat(state)
+        if stopped_by is not None:
+            heartbeat["stopped_by"] = stopped_by
+        tmp_filepath = self.heartbeat_filepath.with_name(
+            self.heartbeat_filepath.name + ".tmp"
+        )
+        tmp_filepath.write_text(json.dumps(heartbeat, indent=2) + "\n")
+        os.replace(tmp_filepath, self.heartbeat_filepath)
+
+    def __read_heartbeat(self) -> dict | None:
+        # None if there is no heartbeat file; raises if it can't be read
+        if not self.heartbeat_filepath.exists():
+            return None
+        return json.loads(self.heartbeat_filepath.read_text())
+
+    def __check_heartbeat(self):
+        # refuse to start if another driver may be working on this case
+        try:
+            heartbeat = self.__read_heartbeat()
+        except Exception as error:
+            message = (
+                f"[ MESA error ] can't read {self.heartbeat_filepath} ({error!r}); "
+                f"if no other driver is running on this case, delete it and start again"
+            )
+            logging.error(message)
+            raise RuntimeError(message) from error
+        if heartbeat is None:
+            return
+
+        host, pid = heartbeat.get("host"), heartbeat.get("pid")
+        last_seen = heartbeat.get("time")
+        if heartbeat.get("state") == "stopped":
+            logging.info(
+                f"previous driver (host {host}, PID {pid}) stopped at {last_seen}: "
+                f"{heartbeat.get('stopped_by')}"
+            )
+            return
+
+        try:
+            age = (
+                datetime.now().astimezone() - datetime.fromisoformat(last_seen)
+            ).total_seconds()
+        except Exception:
+            age = 0.0  # no usable time: assume it may be alive
+        if age < 2 * self.poll_interval:
+            message = (
+                f"[ MESA error ] another driver may be running (host {host}, "
+                f"PID {pid}, last seen {last_seen}); if not, delete "
+                f"{self.heartbeat_filepath} and start again."
+            )
+            logging.error(message)
+            raise RuntimeError(message)
+        logging.warning(
+            f"old heartbeat from a driver that did not stop cleanly (host {host}, "
+            f"PID {pid}, last seen {last_seen}); taking over"
+        )
+
+    def __mark_heartbeat_stopped(self, stopped_by: str):
+        # rewrite the heartbeat as stopped, unless it now belongs to another
+        # driver; a failure here is logged, so it can't hide the original error
+        try:
+            heartbeat = self.__read_heartbeat()
+            if heartbeat is not None and (
+                heartbeat.get("host") != socket.gethostname()
+                or heartbeat.get("pid") != os.getpid()
+            ):
+                logging.warning(
+                    f"{self.heartbeat_filepath} now belongs to another driver "
+                    f"(host {heartbeat.get('host')}, PID {heartbeat.get('pid')}); "
+                    f"left as it is"
+                )
+                return
+            self.__write_heartbeat("stopped", stopped_by=stopped_by)
+        except Exception:
+            logging.exception(f"could not mark {self.heartbeat_filepath} as stopped")
 
     def __initialize_evaluations_data_file(self):
         # create the empty dataframe to store the evaluation data and save it to HDF

@@ -13,6 +13,9 @@ class SimulationRun(ABC):
     directory: Path
     run_number: int
     launch_time: float
+    # optional: the scheduler's ID for the run's current job, if there is
+    # one; shown in the heartbeat file
+    job_id: str | None = None
 
     @abstractmethod
     def status(self) -> RunStatus:
