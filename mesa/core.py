@@ -64,6 +64,30 @@ class Mesa:
             self.__initialize_evaluations_data_file()
 
     def run(self):
+        """
+        Runs the optimisation. An error that is not handled for a single run
+        (evaluation data file, optimiser, settings, anything unexpected) is
+        logged with the runs still in flight, then raised: the driver stops,
+        and the jobs are not cancelled, so they can be picked up again.
+        """
+        self.runs_in_flight: set[SimulationRun] = set()
+        try:
+            self.__run()
+        except Exception:
+            logging.exception("[ MESA error ] driver stopping on an unexpected error")
+            if self.runs_in_flight:
+                logging.error(
+                    "runs still in flight (not cancelled): "
+                    + ", ".join(
+                        f"run {run.run_number}: {run.directory}"
+                        for run in sorted(self.runs_in_flight, key=lambda r: r.run_number)
+                    )
+                )
+            else:
+                logging.error("no runs in flight")
+            raise
+
+    def __run(self):
         while not self.converged:
             df: DataFrame = read_hdf(self.evaluations_filepath)
             # get the current iteration number
@@ -97,8 +121,12 @@ class Mesa:
         Launches and manages all the simulations runs required to complete
         the current iteration.
         """
+        # the runs in flight; kept on self so that run() can log them on an error
         current_runs: set[SimulationRun] = set()
+        self.runs_in_flight = current_runs
         completed_runs: set[SimulationRun] = set()
+        # consecutive failed status checks, per run
+        status_failures: dict[SimulationRun, int] = {}
         total_requested_runs = len(pending_points)
         pending_run_numbers = set(
             range(initial_run_number, initial_run_number + total_requested_runs)
@@ -114,12 +142,42 @@ class Mesa:
             # they have finished or timed-out
             run: SimulationRun
             for run in current_runs_iterable:
-                run_status = run.status()
+                try:
+                    run_status = run.status()
+                except Exception as error:
+                    # e.g. an output file read mid-write, or a scheduler or
+                    # file-system hiccup: treat the run as running, retry next poll
+                    failures = status_failures.get(run, 0) + 1
+                    status_failures[run] = failures
+                    logging.warning(
+                        f"run {run.run_number}: status check failed ({error!r}), "
+                        f"retrying next poll",
+                        exc_info=failures == 1,  # traceback once per streak
+                    )
+                    if failures == 3:
+                        logging.warning(
+                            f"run {run.run_number}: status check failing, needs attention"
+                        )
+                    continue
+                status_failures.pop(run, None)
+
                 if run_status == "complete":
                     # get the objective function value
-                    objective_values = self.objective_function.evaluate(
-                        simulation_results=run.get_results()
-                    )
+                    try:
+                        objective_values = self.objective_function.evaluate(
+                            simulation_results=run.get_results()
+                        )
+                    except Exception as error:
+                        # a bad result from this run: count it as crashed and
+                        # carry on with the others (its folder is kept)
+                        logging.warning(
+                            f"run {run.run_number}: scoring failed ({error!r}), "
+                            f"counted as crashed; folder kept: {run.directory}",
+                            exc_info=True,
+                        )
+                        current_runs.remove(run)
+                        completed_runs.add(run)
+                        continue
 
                     # build a new row for the dataframe
                     new_row = {"run_number": run.run_number, "iteration": iteration}
