@@ -43,6 +43,9 @@ class Mesa:
         # rewritten after each pass: whether the driver is alive and what it
         # is waiting on
         self.heartbeat_filepath = simulations_directory / "heartbeat.json"
+        # the current iteration's points not yet launched, so that a restart
+        # can carry on the iteration
+        self.iteration_filepath = simulations_directory / "iteration.json"
         self.converged = False
 
         # split the parameters up into those which have free or fixed values
@@ -87,6 +90,12 @@ class Mesa:
         stops (state "stopped"). The driver refuses to start if it finds a
         "running" heartbeat younger than 2 x poll_interval: another driver
         may be working on the same case.
+
+        iteration.json in the simulations directory holds the current
+        iteration's points that have not been launched yet. On a restart,
+        once the runs left in flight have finished, those points are
+        launched under the same iteration number, so a stopped driver does
+        not use up an iteration.
         """
         logger_setup(self.simulations_directory)
         self.__check_heartbeat()
@@ -119,16 +128,13 @@ class Mesa:
     def __run(self):
         # runs left in flight by an earlier driver are finished first
         self.__finish_adopted_runs()
+        # then the points of that iteration it had not launched
+        self.__resume_iteration()
 
         while not self.converged:
             df: DataFrame = read_hdf(self.evaluations_filepath)
-            # get the current iteration number; the first new run number is
-            # past every recorded run and every run folder
-            run_folders = self.__existing_run_numbers()
-            initial_run_number = max(
-                0 if df.empty else int(df["run_number"].max()) + 1,
-                max(run_folders, default=-1) + 1,
-            )
+            # get the current iteration number
+            initial_run_number = self.__next_run_number(df)
             iteration = 0 if df.empty else df["iteration"].max() + 1
 
             if iteration > self.max_iterations:
@@ -150,6 +156,85 @@ class Mesa:
                 initial_run_number=initial_run_number,
                 pending_points=new_points,
             )
+
+    def __next_run_number(self, df: DataFrame) -> int:
+        # past every recorded run and every run folder
+        run_folders = self.__existing_run_numbers()
+        return max(
+            0 if df.empty else int(df["run_number"].max()) + 1,
+            max(run_folders, default=-1) + 1,
+        )
+
+    def __resume_iteration(self):
+        """
+        Launches the points an earlier driver proposed but had not launched
+        when it stopped (from iteration.json), under their own iteration
+        number. A missing file, or one with no points left, means there is
+        nothing to resume; an unreadable file or one that doesn't match the
+        evaluations file is logged and ignored, and the driver carries on
+        with the next iteration.
+        """
+        if not self.iteration_filepath.exists():
+            return
+        try:
+            saved = json.loads(self.iteration_filepath.read_text())
+            iteration = int(saved["iteration"])
+            points = [dict(point) for point in saved["pending_points"]]
+        except Exception as error:
+            logging.warning(
+                f"can't read {self.iteration_filepath} ({error!r}); its points "
+                f"are not resumed"
+            )
+            return
+        if not points:
+            return
+
+        df: DataFrame = read_hdf(self.evaluations_filepath)
+        last_iteration = -1 if df.empty else int(df["iteration"].max())
+        if iteration not in (last_iteration, last_iteration + 1):
+            logging.warning(
+                f"{self.iteration_filepath} is for iteration {iteration}, but the "
+                f"last recorded iteration is {last_iteration}; its points are "
+                f"not resumed"
+            )
+            return
+        if any(set(point) != set(self.parameters) for point in points):
+            logging.warning(
+                f"the parameters in {self.iteration_filepath} don't match the "
+                f"input; its points are not resumed"
+            )
+            return
+
+        logging.info(
+            f"--- Resuming iteration {iteration}: {len(points)} points not "
+            f"launched by an earlier driver ---"
+        )
+        self.launch_iteration(
+            iteration=iteration,
+            initial_run_number=self.__next_run_number(df),
+            pending_points=points,
+        )
+
+    def __write_iteration_file(self, iteration: int, pending_points: list[dict]):
+        # tmp file + rename, as for the heartbeat; numpy numbers are written
+        # as plain numbers
+        def plain(value):
+            if hasattr(value, "item"):
+                return value.item()
+            raise TypeError(f"can't write {value!r} to {self.iteration_filepath}")
+
+        tmp_filepath = self.iteration_filepath.with_name(
+            self.iteration_filepath.name + ".tmp"
+        )
+        tmp_filepath.write_text(
+            json.dumps(
+                {"iteration": int(iteration), "pending_points": pending_points},
+                indent=2,
+                default=plain,
+            )
+            + "\n"
+        )
+        os.replace(tmp_filepath, self.iteration_filepath)
 
     def __existing_run_numbers(self) -> set[int]:
         return {
@@ -240,6 +325,8 @@ class Mesa:
         pending_run_numbers = set(
             range(initial_run_number, initial_run_number + total_requested_runs)
         )
+        # the points not launched yet, kept on disk for a restart
+        self.__write_iteration_file(iteration, pending_points)
 
         # main monitoring loop for the simulation runs: each pass checks the
         # runs in flight, then fills the free slots, then waits
@@ -279,6 +366,9 @@ class Mesa:
                     )
                     current_runs.add(new_run)
                     self.run_statuses[new_run] = "launched"
+                    # after the launch: a driver stopped in between launches
+                    # this point again on a restart, rather than losing it
+                    self.__write_iteration_file(iteration, pending_points)
 
             self.__write_heartbeat("running")
 
