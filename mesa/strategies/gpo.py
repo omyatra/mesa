@@ -43,7 +43,9 @@ class GPOptimizer(Strategy):
         objective_name: str,
     ) -> list[dict]:
 
-        n_evals = 0 if evaluation_data.empty else evaluation_data["run_number"].max()
+        # every finished run has one row, whatever its status; run numbers
+        # start at 0, so the highest one is one less than the run count
+        n_evals = len(evaluation_data)
 
         if n_evals < self.initial_sample_count:
             return self.get_initial_samples(
