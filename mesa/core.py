@@ -27,6 +27,11 @@ class Mesa:
         simulations_directory: Path,
         poll_interval: float = 1800.0,
     ):
+        """
+        max_iterations is the last iteration number to run. Iterations are
+        numbered from 0 (with GPOptimizer, iteration 0 is the initial random
+        batch), so up to max_iterations + 1 iterations are run.
+        """
         self.parameters = parameters
         self.simulation = simulation
         self.objective_function = objective_function
