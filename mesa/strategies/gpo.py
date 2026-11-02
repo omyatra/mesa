@@ -65,6 +65,16 @@ class GPOptimizer(Strategy):
                     f"usable score (stalled runs excluded), and the GP needs at "
                     f"least 2: check why the runs failed"
                 )
+            # the GP fit takes the log of the scores' spread, which fails
+            # (NaN) when it is zero
+            scores = scored_data[objective_name]
+            if scores.max() == scores.min():
+                raise ValueError(
+                    f"all {len(scored_data)} runs with a usable score have the "
+                    f"same score ({scores.iloc[0]}), and the GP can't fit scores "
+                    f"with no spread: the runs probably gave the same output "
+                    f"(check that the parameters reach the simulation)"
+                )
             return self.gpo_search(
                 evaluation_data=scored_data,
                 optimization_bounds=optimization_bounds,
