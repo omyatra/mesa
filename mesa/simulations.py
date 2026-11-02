@@ -4,7 +4,9 @@ from typing import Literal, Any
 
 
 # "stalled": the plug-in has stopped trying to converge the run; it is
-# scored like a complete run, and marked "stalled" in the evaluations file
+# scored like a complete run and marked "stalled" in the evaluations file,
+# but the GP strategy leaves it out of its fit (it never reached a steady
+# state)
 RunStatus = Literal["running", "complete", "stalled", "timed-out", "crashed"]
 
 

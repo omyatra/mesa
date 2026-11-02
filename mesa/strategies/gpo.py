@@ -51,13 +51,19 @@ class GPOptimizer(Strategy):
                 optimization_bounds=optimization_bounds,
             )
         else:
-            # fit only the runs with a score: crashed and timed-out runs have
-            # a NaN objective (the initial sample count above counts every run)
-            scored_data = evaluation_data[evaluation_data[objective_name].notna()]
+            # fit only the runs with a usable score: crashed and timed-out
+            # runs have a NaN objective, and stalled runs never converged, so
+            # their score is not from a steady state (the initial sample
+            # count above counts every run)
+            scored_data = evaluation_data[
+                evaluation_data[objective_name].notna()
+                & (evaluation_data["status"] != "stalled")
+            ]
             if len(scored_data) < 2:
                 raise ValueError(
                     f"only {len(scored_data)} of {len(evaluation_data)} runs have a "
-                    f"score, and the GP needs at least 2: check why the runs failed"
+                    f"usable score (stalled runs excluded), and the GP needs at "
+                    f"least 2: check why the runs failed"
                 )
             return self.gpo_search(
                 evaluation_data=scored_data,
