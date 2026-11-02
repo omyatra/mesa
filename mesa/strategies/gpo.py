@@ -157,7 +157,8 @@ class GPOptimizer(Strategy):
         #     )
 
         logging.info("New parameters:")
-        logging.info(free_params)
+        # plain numbers, not np.float64(...)
+        logging.info({key: float(val) for key, val in free_params.items()})
 
         return [free_params]
 

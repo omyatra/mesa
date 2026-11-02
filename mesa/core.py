@@ -110,9 +110,13 @@ class Mesa:
         self.current_iteration: int | None = None
         self.__write_heartbeat("running")
         stopped_by = "interrupted"  # e.g. Ctrl-C
+        interrupted = False
         try:
             self.__run()
             stopped_by = "finished"
+        except KeyboardInterrupt:
+            # a short message below instead of a traceback
+            interrupted = True
         except Exception as error:
             stopped_by = f"error: {error!r}"
             logging.exception("[ MESA error ] driver stopping on an unexpected error")
@@ -128,7 +132,20 @@ class Mesa:
                 logging.error("no runs in flight")
             raise
         finally:
-            self.__mark_heartbeat_stopped(stopped_by)
+            heartbeat_stopped = self.__mark_heartbeat_stopped(stopped_by)
+
+        if interrupted:
+            logging.warning(
+                "interrupted (Ctrl-C), "
+                + (
+                    "heartbeat marked stopped"
+                    if heartbeat_stopped
+                    else "heartbeat not marked stopped (see above)"
+                )
+                + "; runs in flight not cancelled"
+            )
+            # exit status 130, as for a process stopped by Ctrl-C
+            raise SystemExit(130)
 
     def __run(self):
         # runs left in flight by an earlier driver are finished first
@@ -361,7 +378,8 @@ class Mesa:
                 for run_number in runs_to_launch:
                     point = pending_points.pop()
                     logging.info(f"Run number {run_number} - New parameters:")
-                    logging.info([point[k] for k in self.free_parameter_keys])
+                    # plain numbers, not np.float64(...)
+                    logging.info([float(point[k]) for k in self.free_parameter_keys])
 
                     new_run = self.simulation.launch(
                         run_number=run_number,
@@ -553,7 +571,9 @@ class Mesa:
             message = (
                 f"[ MESA error ] another driver may be running (host {host}, "
                 f"PID {pid}, last seen {last_seen}); if not, delete "
-                f"{self.heartbeat_filepath} and start again."
+                f"{self.heartbeat_filepath} and start again, or wait "
+                f"2 x poll_interval ({2 * self.poll_interval:g} s) after the "
+                f"last-seen time and restart."
             )
             logging.error(message)
             raise RuntimeError(message)
@@ -562,9 +582,10 @@ class Mesa:
             f"PID {pid}, last seen {last_seen}); taking over"
         )
 
-    def __mark_heartbeat_stopped(self, stopped_by: str):
+    def __mark_heartbeat_stopped(self, stopped_by: str) -> bool:
         # rewrite the heartbeat as stopped, unless it now belongs to another
-        # driver; a failure here is logged, so it can't hide the original error
+        # driver; a failure here is logged, so it can't hide the original
+        # error. Returns whether the heartbeat was marked stopped.
         try:
             heartbeat = self.__read_heartbeat()
             if heartbeat is not None and (
@@ -576,10 +597,12 @@ class Mesa:
                     f"(host {heartbeat.get('host')}, PID {heartbeat.get('pid')}); "
                     f"left as it is"
                 )
-                return
+                return False
             self.__write_heartbeat("stopped", stopped_by=stopped_by)
+            return True
         except Exception:
             logging.exception(f"could not mark {self.heartbeat_filepath} as stopped")
+            return False
 
     def __initialize_evaluations_data_file(self):
         # create the empty dataframe to store the evaluation data and save it to HDF
